@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         autoreger
 // @namespace    http://tampermonkey.net/
-// @version      5.1
-// @description  Универсальный автозаполнитель форм регистрации: логин с автоинкрементом, пароль в оба поля, клик по кнопке, окно отдачи, откат при ошибках
+// @version      5.2
+// @description  Универсальный автозаполнитель регистрации: инкремент логина, пароль в оба поля, клик по кнопке, отдача только подтверждённых аккаунтов, без дублей
 // @match        *://*/*
 // @noframes
 // @grant        GM_getValue
@@ -16,7 +16,7 @@
     'use strict';
 
     /* ============================================================
-       CONFIG — ЕДИНСТВЕННОЕ МЕСТО, КОТОРОЕ МЕНЯЕТСЯ ПОД СВОЙ САЙТ
+       CONFIG — меняется под свой сайт
        ============================================================ */
     const CONFIG = {
         loginSelectors: [
@@ -35,12 +35,17 @@
         signupUrl: '',
         submitDelay: 300,
 
-        // Фразы, которые считаются ОШИБКОЙ регистрации → откат счётчика и удаление из отдачи.
-        errorText: /already\s*(exists|registered|in\s*use|taken)|уже\s*(существует|зарегистрирован|занят)|\bexists\b|\btaken\b|duplicate|дубликат|invalid|неверн|некоррект|ошибк|\berror\b|failed|failure|не\s*удалось|unable|невозможн|rejected|отклонен|denied|too\s*many|слишком\s*много|captcha|каптч/i,
-        // Фразы УСПЕХА — на них откат НЕ срабатывает.
-        successText: /success|created|welcome|успеш|создан|добро\s*пожаловать|готово|account\s*created/i,
-        // Сколько мс после клика следить за inline-ошибками в DOM.
-        errorWatchMs: 12000,
+        // Сколько ждать подтверждения успеха после клика (мс).
+        successWaitMs: 8000,
+        // Если сайт НЕ редиректит и не показывает сообщение об успехе —
+        // поставь true, чтобы считать успехом по истечении ожидания.
+        // По умолчанию false = безопаснее (неудачные не попадают в отдачу).
+        commitOnTimeout: false,
+
+        // Фразы-ОШИБКИ → аккаунт не создан, в отдачу НЕ писать, счётчик НЕ увеличивать.
+        errorText: /already\s*(exists|registered|in\s*use|taken)|уже\s*(существует|зарегистрирован|занят)|\bexists\b|\btaken\b|duplicate|дубликат|invalid|неверн|некоррект|ошибк|\berror\b|failed|failure|не\s*удалось|unable|невозможн|rejected|отклонен|denied|too\s*many|слишком\s*много|try\s*again|rate[\s-]*limit|лимит|превышен|попробуйте\s*(позже|завтра)|повторите\s*попытку|captcha|каптч|blocked|заблокирован|suspended|ограничен/i,
+        // Фразы-УСПЕХА → подтверждение создания.
+        successText: /success|created|welcome|успеш|создан|добро\s*пожаловать|готово|account\s*created|registration\s*complete/i,
     };
     /* ============================================================ */
 
@@ -55,7 +60,7 @@
     let lastAutoNav = 0;
     let flashTimer = null;
     let registering = false;
-    let lastReg = null; // { login, pass, entry, time, rolledBack }
+    let pending = null; // { login, pass, time, startUrl }
 
     function nextValue(str) {
         const at = str.indexOf('@');
@@ -127,7 +132,7 @@
         <div style="display:flex;align-items:center;justify-content:space-between;">
             <div style="color:#e4e4ec;font-size:12px;font-weight:bold;letter-spacing:2px;text-transform:uppercase;">autoreger</div>
             <div style="display:flex;align-items:center;gap:6px;">
-                <div style="color:#6b6b76;font-size:10px;">v5.1</div>
+                <div style="color:#6b6b76;font-size:10px;">v5.2</div>
                 <button id="gm-hide" type="button" title="Скрыть панель на этом сайте"
                         style="padding:2px 8px;background:#333;color:#fff;border:0;border-radius:6px;cursor:pointer;font-size:13px;line-height:1;">–</button>
             </div>
@@ -194,6 +199,8 @@
     const autoChk   = panel.querySelector('#gm-auto');
     const logTa     = panel.querySelector('#gm-log');
     const logLabel  = panel.querySelector('#gm-log-label');
+    const regBtn    = panel.querySelector('#gm-register');
+    const regBtnLabel = 'Создать аккаунт →';
     autoChk.checked = autoNav;
     logTa.value = log;
     logTa.scrollTop = logTa.scrollHeight;
@@ -215,7 +222,7 @@
         statusEl.textContent = msg;
         statusEl.style.color = ok ? '#4ade80' : '#f87171';
         clearTimeout(flashTimer);
-        flashTimer = setTimeout(() => { statusEl.textContent = ''; }, 3000);
+        flashTimer = setTimeout(() => { statusEl.textContent = ''; }, 4000);
     }
 
     function updateLabels() {
@@ -230,78 +237,116 @@
     }
     updateLogLabel();
 
+    function setRegBusy(v) {
+        regBtn.disabled = v;
+        regBtn.textContent = v ? 'Жду ответ…' : regBtnLabel;
+        regBtn.style.opacity = v ? '0.6' : '1';
+        regBtn.style.cursor = v ? 'wait' : 'pointer';
+    }
+
+    // Запись в отдачу с защитой от дублей (один логин — одна запись).
     function appendLog(login, pass) {
-        const entry = login + '\n' + pass;
-        log = log ? log + '\n\n' + entry : entry;
-        GM_setValue('log', log);
+        const blocks = log ? log.split(/\n{2,}/).filter(b => b.trim()) : [];
+        const exists = blocks.some(b => b.split('\n')[0].trim() === login);
+        if (!exists) {
+            blocks.push(login + '\n' + pass);
+            log = blocks.join('\n\n');
+            GM_setValue('log', log);
+        }
         logTa.value = log;
         logTa.scrollTop = logTa.scrollHeight;
         updateLogLabel();
     }
 
-    function removeLogEntry(entry) {
-        const blocks = log.split(/\n{2,}/).filter(b => b.trim());
-        const idx = blocks.lastIndexOf(entry);
-        if (idx === -1) return;
-        blocks.splice(idx, 1);
-        log = blocks.join('\n\n');
-        GM_setValue('log', log);
-        logTa.value = log;
-        updateLogLabel();
+    // ===== подтверждение / отклонение регистрации =====
+    function commitPending() {
+        if (!pending) return;
+        const { login, pass } = pending;
+        pending = null;
+        setRegBusy(false);
+        current = nextValue(login);
+        GM_setValue('current', current);
+        syncTextarea();
+        updateLabels();
+        appendLog(login, pass);
+        flash('Создан ✓ ' + login);
     }
 
-    // ===== откат при ошибке сайта =====
-    function handleSiteError(text) {
-        if (!lastReg || lastReg.rolledBack) return;
-        if (Date.now() - lastReg.time > 30000) return;
-        lastReg.rolledBack = true;
-
-        removeLogEntry(lastReg.entry);
-
-        let reverted = false;
-        // откатываем счётчик, только если он всё ещё стоит на "оптимистичном" следующем значении
-        if (current === nextValue(lastReg.login)) {
-            current = lastReg.login;
-            GM_setValue('current', current);
-            syncTextarea();
-            updateLabels();
-            reverted = true;
-        }
-        const short = text.replace(/\s+/g, ' ').trim().slice(0, 80);
-        flash('Ошибка: ' + short + (reverted ? ' — счётчик возвращён' : ' — запись удалена'), false);
+    function failPending(text) {
+        if (!pending) return;
+        pending = null;
+        setRegBusy(false);
+        const short = String(text).replace(/\s+/g, ' ').trim().slice(0, 90);
+        flash('Не создано: ' + short + ' — счётчик не увеличен, в отдачу не записано', false);
     }
 
-    function scanDomError() {
-        if (!lastReg || lastReg.rolledBack) return;
-        if (Date.now() - lastReg.time > CONFIG.errorWatchMs) return;
-        const sels = '[role="alert"],[class*="error"],[class*="alert"],[class*="toast"],[class*="notification"],[class*="message"],[data-error]';
-        for (const el of document.querySelectorAll(sels)) {
-            if (panel.contains(el) || badge.contains(el)) continue;
-            if (!el.getClientRects().length) continue;
-            const txt = (el.textContent || '').replace(/\s+/g, ' ').trim();
-            if (txt && txt.length <= 300 && CONFIG.errorText.test(txt) && !CONFIG.successText.test(txt)) {
-                handleSiteError(txt);
-                return;
+    function watchPending() {
+        if (!pending) return;
+        // Уход со страницы регистрации (редирект) = успех.
+        if (location.href !== pending.startUrl) { commitPending(); return; }
+        if (Date.now() - pending.time >= CONFIG.successWaitMs) {
+            if (CONFIG.commitOnTimeout) {
+                commitPending();
+            } else {
+                const login = pending.login;
+                pending = null;
+                setRegBusy(false);
+                flash('Не подтверждено: ' + login + ' — проверь вручную, в отдачу не записано', false);
             }
         }
     }
 
-    // перехват alert() сайта (как на скриншоте "User with this email already exists.")
-    (function hookSiteAlerts() {
+    function scanDomMessages() {
+        if (!pending) return;
+        const sels = '[role="alert"],[role="status"],[class*="error"],[class*="alert"],[class*="toast"],[class*="notification"],[class*="message"],[class*="success"],[data-error]';
+        for (const el of document.querySelectorAll(sels)) {
+            if (panel.contains(el) || badge.contains(el)) continue;
+            if (!el.getClientRects().length) continue;
+            const txt = (el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (!txt || txt.length > 300) continue;
+            if (CONFIG.errorText.test(txt) && !CONFIG.successText.test(txt)) { failPending(txt); return; }
+            if (CONFIG.successText.test(txt)) { commitPending(); return; }
+        }
+    }
+
+    function onSiteAlert(text) {
+        if (!pending) return;
+        if (CONFIG.errorText.test(text) && !CONFIG.successText.test(text)) failPending(text);
+        else if (CONFIG.successText.test(text)) commitPending();
+    }
+
+    // Перехват alert() сайта — работает и в песочнице, и в контексте страницы.
+    (function installAlertHook() {
         const w = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+        const evt = '__autoreger_alert';
         try {
-            const orig = w.alert;
-            if (typeof orig !== 'function') return;
-            w.alert = function (msg) {
-                const text = String(msg == null ? '' : msg);
-                if (CONFIG.errorText.test(text) && !CONFIG.successText.test(text)) {
-                    handleSiteError(text);
-                }
-                return orig.apply(this, arguments);
-            };
-        } catch (e) { /* если подмена запрещена — остаётся scanDomError */ }
+            const s = document.createElement('script');
+            s.textContent = '(' + function () {
+                if (window.__autoregerAlertHooked) return;
+                window.__autoregerAlertHooked = true;
+                const orig = window.alert;
+                window.alert = function (msg) {
+                    try { window.dispatchEvent(new CustomEvent('__autoreger_alert', { detail: String(msg == null ? '' : msg) })); } catch (e) {}
+                    return orig.apply(this, arguments);
+                };
+            } + ')();';
+            (document.head || document.documentElement).appendChild(s);
+            s.remove();
+        } catch (e) {}
+        try {
+            if (!w.__autoregerAlertHooked) {
+                const orig = w.alert;
+                w.alert = function (msg) {
+                    try { w.dispatchEvent(new CustomEvent('__autoreger_alert', { detail: String(msg == null ? '' : msg) })); } catch (e) {}
+                    return orig.apply(this, arguments);
+                };
+                w.__autoregerAlertHooked = true;
+            }
+        } catch (e) {}
+        w.addEventListener(evt, (e) => onSiteAlert(String((e && e.detail) || '')));
     })();
 
+    // ===== обработчики панели =====
     ta.addEventListener('input', () => {
         const lines = ta.value.split(/\r?\n/);
         const loginLine = (lines[0] || '').trim();
@@ -346,39 +391,33 @@
         return true;
     }
 
+    // Регистрация: заполнить → клик → ждать подтверждения. В отдачу — только успех.
     function registerAccount() {
-        if (registering) return;
-        const usedLogin = insertLogin(true);
-        if (!usedLogin) return;
-        if (!insertPassword(true)) return;
+        if (registering || pending) return;
+        if (!current) { flash('Введи логин в 1-й строке', false); ta.focus(); return; }
+        if (!password) { flash('Введи пароль во 2-й строке', false); ta.focus(); return; }
+        const loginInput = findLoginInput();
+        if (!loginInput) { flash('Поле логина не найдено — проверь CONFIG.loginSelectors', false); return; }
+        const passInputs = findPasswordInputs();
+        if (!passInputs.length) { flash('Поля пароля не найдены — проверь CONFIG.passwordSelector', false); return; }
+
+        const usedLogin = current;
         const usedPass = password;
+        loginInput.focus();
+        setNativeValue(loginInput, usedLogin);
+        passInputs.forEach(i => setNativeValue(i, usedPass));
 
         registering = true;
-        flash('Поля заполнены, жму кнопку регистрации…');
+        flash('Поля заполнены, отправляю…');
         setTimeout(() => {
             registering = false;
             const btn = findSubmitButton();
-            if (!btn) {
-                // кнопка не найдена — откатываем то, что успели сделать
-                current = usedLogin;
-                GM_setValue('current', current);
-                syncTextarea();
-                updateLabels();
-                flash('Кнопка не найдена — проверь CONFIG.submitSelector', false);
-                return;
-            }
-            if (btn.disabled) {
-                current = usedLogin;
-                GM_setValue('current', current);
-                syncTextarea();
-                updateLabels();
-                flash('Кнопка неактивна — проверь поля', false);
-                return;
-            }
+            if (!btn) { flash('Кнопка не найдена — проверь CONFIG.submitSelector', false); return; }
+            if (btn.disabled) { flash('Кнопка неактивна — проверь поля', false); return; }
+            pending = { login: usedLogin, pass: usedPass, time: Date.now(), startUrl: location.href };
+            setRegBusy(true);
+            flash('Отправлено, жду ответ сайта…');
             btn.click();
-            appendLog(usedLogin, usedPass);
-            lastReg = { login: usedLogin, pass: usedPass, entry: usedLogin + '\n' + usedPass, time: Date.now(), rolledBack: false };
-            flash('Кнопка нажата ✓ жду ответ сайта…');
         }, CONFIG.submitDelay);
     }
 
@@ -413,7 +452,7 @@
         updateLabels();
         flash('Сброшено к: ' + (template || '—'));
     });
-    panel.querySelector('#gm-register').addEventListener('click', registerAccount);
+    regBtn.addEventListener('click', registerAccount);
 
     panel.querySelector('#gm-copy').addEventListener('click', () => {
         if (!log) { flash('Отдача пока пустая', false); return; }
@@ -433,10 +472,11 @@
     setInterval(() => {
         if (!document.body.contains(panel)) document.body.appendChild(panel);
         if (!document.body.contains(badge)) document.body.appendChild(badge);
-        scanDomError();
+        watchPending();
+        scanDomMessages();
         if (autoNav && Date.now() - lastAutoNav > 3000 && !onSignupPage() && findSignupLink()) {
             lastAutoNav = Date.now();
             goToSignup(true);
         }
-    }, 1000);
+    }, 500);
 })();
