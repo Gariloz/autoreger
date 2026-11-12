@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         autoreger
 // @namespace    http://tampermonkey.net/
-// @version      5.0
-// @description  Универсальный автозаполнитель форм регистрации: логин с автоинкрементом, пароль в оба поля, клик по кнопке, окно отдачи
+// @version      5.1
+// @description  Универсальный автозаполнитель форм регистрации: логин с автоинкрементом, пароль в оба поля, клик по кнопке, окно отдачи, откат при ошибках
 // @match        *://*/*
 // @noframes
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_setClipboard
+// @grant        unsafeWindow
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -16,10 +17,8 @@
 
     /* ============================================================
        CONFIG — ЕДИНСТВЕННОЕ МЕСТО, КОТОРОЕ МЕНЯЕТСЯ ПОД СВОЙ САЙТ
-       Замени селекторы на те, что есть на целевой странице.
        ============================================================ */
     const CONFIG = {
-        // Поле логина/email. Селекторы пробуются по очереди, берётся первое найденное.
         loginSelectors: [
             'input[type="email"]',
             'input[name="email"]',
@@ -27,47 +26,37 @@
             'input[name*="login"]',
             'input[id*="login"]',
         ],
-
-        // Поля пароля. Заполняются ВСЕ найденные (пароль + повтор).
         passwordSelector: 'input[type="password"]',
-
-        // Кнопка отправки формы.
         submitSelector: 'button[type="submit"], input[type="submit"]',
-        // Запасной поиск кнопки по тексту (если селекторов несколько).
         submitText: /create\s*account|sign\s*up|register|join|зарегистрир|создать\s*аккаунт|регистрац/i,
-
-        // Ссылка на страницу регистрации (для авто-возврата).
-        signupLinkSelectors: [
-            'a[href*="signup"]',
-            'a[href*="register"]',
-            'a[href*="registration"]',
-        ],
+        signupLinkSelectors: ['a[href*="signup"]', 'a[href*="register"]', 'a[href*="registration"]'],
         signupLinkText: /create\s*an?\s*account|sign\s*up|register|регистрац/i,
-
-        // Как понять, что ты уже на странице регистрации (авто-возврат туда не кликает).
         signupPagePattern: /sign[-_]?up|register|registration/i,
-
-        // Запасной прямой адрес регистрации, если ссылка не найдена. Пусто = не переходить.
         signupUrl: '',
-
-        // Пауза между заполнением полей и кликом по кнопке (мс), чтобы форма успела принять значения.
         submitDelay: 300,
+
+        // Фразы, которые считаются ОШИБКОЙ регистрации → откат счётчика и удаление из отдачи.
+        errorText: /already\s*(exists|registered|in\s*use|taken)|уже\s*(существует|зарегистрирован|занят)|\bexists\b|\btaken\b|duplicate|дубликат|invalid|неверн|некоррект|ошибк|\berror\b|failed|failure|не\s*удалось|unable|невозможн|rejected|отклонен|denied|too\s*many|слишком\s*много|captcha|каптч/i,
+        // Фразы УСПЕХА — на них откат НЕ срабатывает.
+        successText: /success|created|welcome|успеш|создан|добро\s*пожаловать|готово|account\s*created/i,
+        // Сколько мс после клика следить за inline-ошибками в DOM.
+        errorWatchMs: 12000,
     };
     /* ============================================================ */
 
     const hostKey = location.host;
 
-    let template = GM_getValue('template', '');      // запомненное вручную (для ↺)
-    let current  = GM_getValue('current', template); // что вставится следующим
+    let template = GM_getValue('template', '');
+    let current  = GM_getValue('current', template);
     let password = GM_getValue('password', '');
-    let log      = GM_getValue('log', '');           // отдача
-    let autoNav  = GM_getValue('autoNav_' + hostKey, false); // авто-возврат (на каждый сайт свой)
-    let hidden   = GM_getValue('hidden_' + hostKey, false);  // видимость панели (на каждый сайт своя)
+    let log      = GM_getValue('log', '');
+    let autoNav  = GM_getValue('autoNav_' + hostKey, false);
+    let hidden   = GM_getValue('hidden_' + hostKey, false);
     let lastAutoNav = 0;
     let flashTimer = null;
     let registering = false;
+    let lastReg = null; // { login, pass, entry, time, rolledBack }
 
-    // увеличить последнее число до @ (320 -> 321, 007 -> 008)
     function nextValue(str) {
         const at = str.indexOf('@');
         const local  = at === -1 ? str : str.slice(0, at);
@@ -80,7 +69,6 @@
         return local + '1' + domain;
     }
 
-    // совместимая с React/Vue установка значения
     function setNativeValue(input, value) {
         const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
         setter.call(input, value);
@@ -97,15 +85,12 @@
     }
 
     function findPasswordInputs() {
-        return [...document.querySelectorAll(CONFIG.passwordSelector)]
-            .filter(i => !panel.contains(i));
+        return [...document.querySelectorAll(CONFIG.passwordSelector)].filter(i => !panel.contains(i));
     }
 
     function findSubmitButton() {
-        const candidates = [...document.querySelectorAll(CONFIG.submitSelector)]
-            .filter(b => !panel.contains(b));
-        return candidates.find(b => CONFIG.submitText.test(b.textContent || b.value || ''))
-            || candidates[0] || null;
+        const candidates = [...document.querySelectorAll(CONFIG.submitSelector)].filter(b => !panel.contains(b));
+        return candidates.find(b => CONFIG.submitText.test(b.textContent || b.value || '')) || candidates[0] || null;
     }
 
     function findSignupLink() {
@@ -113,8 +98,7 @@
             const el = document.querySelector(sel);
             if (el && !panel.contains(el)) return el;
         }
-        return [...document.querySelectorAll('a')]
-            .find(a => !panel.contains(a) && CONFIG.signupLinkText.test(a.textContent)) || null;
+        return [...document.querySelectorAll('a')].find(a => !panel.contains(a) && CONFIG.signupLinkText.test(a.textContent)) || null;
     }
 
     function onSignupPage() {
@@ -143,7 +127,7 @@
         <div style="display:flex;align-items:center;justify-content:space-between;">
             <div style="color:#e4e4ec;font-size:12px;font-weight:bold;letter-spacing:2px;text-transform:uppercase;">autoreger</div>
             <div style="display:flex;align-items:center;gap:6px;">
-                <div style="color:#6b6b76;font-size:10px;">v5.0</div>
+                <div style="color:#6b6b76;font-size:10px;">v5.1</div>
                 <button id="gm-hide" type="button" title="Скрыть панель на этом сайте"
                         style="padding:2px 8px;background:#333;color:#fff;border:0;border-radius:6px;cursor:pointer;font-size:13px;line-height:1;">–</button>
             </div>
@@ -195,7 +179,6 @@
     `;
     document.body.appendChild(panel);
 
-    // маленькая кнопка-бейдж, когда панель скрыта
     const badge = document.createElement('button');
     badge.id = 'gm-badge';
     badge.type = 'button';
@@ -256,13 +239,74 @@
         updateLogLabel();
     }
 
-    // разбор поля: строка 1 — логин, строка 2 — пароль
+    function removeLogEntry(entry) {
+        const blocks = log.split(/\n{2,}/).filter(b => b.trim());
+        const idx = blocks.lastIndexOf(entry);
+        if (idx === -1) return;
+        blocks.splice(idx, 1);
+        log = blocks.join('\n\n');
+        GM_setValue('log', log);
+        logTa.value = log;
+        updateLogLabel();
+    }
+
+    // ===== откат при ошибке сайта =====
+    function handleSiteError(text) {
+        if (!lastReg || lastReg.rolledBack) return;
+        if (Date.now() - lastReg.time > 30000) return;
+        lastReg.rolledBack = true;
+
+        removeLogEntry(lastReg.entry);
+
+        let reverted = false;
+        // откатываем счётчик, только если он всё ещё стоит на "оптимистичном" следующем значении
+        if (current === nextValue(lastReg.login)) {
+            current = lastReg.login;
+            GM_setValue('current', current);
+            syncTextarea();
+            updateLabels();
+            reverted = true;
+        }
+        const short = text.replace(/\s+/g, ' ').trim().slice(0, 80);
+        flash('Ошибка: ' + short + (reverted ? ' — счётчик возвращён' : ' — запись удалена'), false);
+    }
+
+    function scanDomError() {
+        if (!lastReg || lastReg.rolledBack) return;
+        if (Date.now() - lastReg.time > CONFIG.errorWatchMs) return;
+        const sels = '[role="alert"],[class*="error"],[class*="alert"],[class*="toast"],[class*="notification"],[class*="message"],[data-error]';
+        for (const el of document.querySelectorAll(sels)) {
+            if (panel.contains(el) || badge.contains(el)) continue;
+            if (!el.getClientRects().length) continue;
+            const txt = (el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (txt && txt.length <= 300 && CONFIG.errorText.test(txt) && !CONFIG.successText.test(txt)) {
+                handleSiteError(txt);
+                return;
+            }
+        }
+    }
+
+    // перехват alert() сайта (как на скриншоте "User with this email already exists.")
+    (function hookSiteAlerts() {
+        const w = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+        try {
+            const orig = w.alert;
+            if (typeof orig !== 'function') return;
+            w.alert = function (msg) {
+                const text = String(msg == null ? '' : msg);
+                if (CONFIG.errorText.test(text) && !CONFIG.successText.test(text)) {
+                    handleSiteError(text);
+                }
+                return orig.apply(this, arguments);
+            };
+        } catch (e) { /* если подмена запрещена — остаётся scanDomError */ }
+    })();
+
     ta.addEventListener('input', () => {
         const lines = ta.value.split(/\r?\n/);
         const loginLine = (lines[0] || '').trim();
         password = lines.length > 1 ? lines[1] : '';
         GM_setValue('password', password);
-
         if (loginLine !== current) {
             template = loginLine;
             current = loginLine;
@@ -278,7 +322,6 @@
         flash(autoNav ? 'Авто-возврат включён' : 'Авто-возврат выключен');
     });
 
-    // возвращает вставленный логин (строку) или false
     function insertLogin(silent) {
         if (!current) { flash('Введи логин в 1-й строке', false); ta.focus(); return false; }
         const input = findLoginInput();
@@ -286,7 +329,6 @@
         const value = current;
         input.focus();
         setNativeValue(input, value);
-
         current = nextValue(current);
         GM_setValue('current', current);
         syncTextarea();
@@ -304,7 +346,6 @@
         return true;
     }
 
-    // логин + пароль + клик по кнопке регистрации + запись в отдачу
     function registerAccount() {
         if (registering) return;
         const usedLogin = insertLogin(true);
@@ -317,11 +358,27 @@
         setTimeout(() => {
             registering = false;
             const btn = findSubmitButton();
-            if (!btn) { flash('Кнопка не найдена — проверь CONFIG.submitSelector', false); return; }
-            if (btn.disabled) { flash('Кнопка неактивна — проверь поля', false); return; }
+            if (!btn) {
+                // кнопка не найдена — откатываем то, что успели сделать
+                current = usedLogin;
+                GM_setValue('current', current);
+                syncTextarea();
+                updateLabels();
+                flash('Кнопка не найдена — проверь CONFIG.submitSelector', false);
+                return;
+            }
+            if (btn.disabled) {
+                current = usedLogin;
+                GM_setValue('current', current);
+                syncTextarea();
+                updateLabels();
+                flash('Кнопка неактивна — проверь поля', false);
+                return;
+            }
             btn.click();
             appendLog(usedLogin, usedPass);
-            flash('Кнопка нажата ✓ записано в отдачу');
+            lastReg = { login: usedLogin, pass: usedPass, entry: usedLogin + '\n' + usedPass, time: Date.now(), rolledBack: false };
+            flash('Кнопка нажата ✓ жду ответ сайта…');
         }, CONFIG.submitDelay);
     }
 
@@ -373,11 +430,10 @@
         flash('Отдача очищена');
     });
 
-    // возврат панели после перерисовки SPA + авто-возврат на регистрацию
     setInterval(() => {
         if (!document.body.contains(panel)) document.body.appendChild(panel);
         if (!document.body.contains(badge)) document.body.appendChild(badge);
-
+        scanDomError();
         if (autoNav && Date.now() - lastAutoNav > 3000 && !onSignupPage() && findSignupLink()) {
             lastAutoNav = Date.now();
             goToSignup(true);
