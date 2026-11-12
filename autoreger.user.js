@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         autoreger
 // @namespace    http://tampermonkey.net/
-// @version      5.4
-// @description  Универсальный автозаполнитель регистрации: инкремент логина, пароль в оба поля, отдача только подтверждённых аккаунтов, без дублей и без залипания ошибок
+// @version      5.5
+// @description  Автозаполнитель регистрации: инкремент, пароль в оба поля, отдача подтверждённых, детект ручных регистраций, без дублей
 // @match        *://*/*
 // @noframes
 // @grant        GM_getValue
@@ -35,11 +35,13 @@
         signupUrl: '',
         submitDelay: 300,
 
-        // Флаг успеха: путь URL после успешной регистрации (пример: /signup -> /onboarding).
         successUrlPattern: /\/onboarding|\/welcome|\/dashboard|\/success|registration[-_]?complete/i,
-
         successWaitMs: 8000,
         commitOnTimeout: false,
+
+        // Ловить РУЧНЫЕ регистрации (кнопка сайта, не панели) и писать их в отдачу +1.
+        trackManual: true,
+        manualWindowMs: 60000, // окно (мс): success вскоре после страницы регистрации = это регистрация
 
         errorText: /already\s*(exists|registered|in\s*use|taken)|уже\s*(существует|зарегистрирован|занят)|\bexists\b|\btaken\b|duplicate|дубликат|invalid|неверн|некоррект|ошибк|\berror\b|failed|failure|не\s*удалось|unable|невозможн|rejected|отклонен|denied|too\s*many|слишком\s*много|try\s*again|rate[\s-]*limit|лимит|превышен|попробуйте\s*(позже|завтра)|повторите\s*попытку|captcha|каптч|blocked|заблокирован|suspended|ограничен/i,
         successText: /account\s*created|registration\s*complete|successfully\s*(registered|created)|welcome|успешн|зарегистрирован|добро\s*пожаловать|аккаунт\s*создан/i,
@@ -58,12 +60,13 @@
     let log      = GM_getValue('log', '');
     let autoNav  = GM_getValue('autoNav_' + hostKey, false);
     let hidden   = GM_getValue('hidden_' + hostKey, false);
-    let pending  = GM_getValue('pending', null); // переживает перезагрузку страницы
+    let pending  = GM_getValue('pending', null);
+    let manualTrack = GM_getValue('manualTrack', { login: '', loginTime: 0, signupTime: 0 });
     let lastAutoNav = 0;
     let flashTimer = null;
     let registering = false;
     let observer = null;
-    let staleMsgEls = new Set(); // сообщения, которые были на странице ДО клика (их игнорируем)
+    let staleMsgEls = new Set();
 
     function nextValue(str) {
         const at = str.indexOf('@');
@@ -135,7 +138,7 @@
         <div style="display:flex;align-items:center;justify-content:space-between;">
             <div style="color:#e4e4ec;font-size:12px;font-weight:bold;letter-spacing:2px;text-transform:uppercase;">autoreger</div>
             <div style="display:flex;align-items:center;gap:6px;">
-                <div style="color:#6b6b76;font-size:10px;">v5.4</div>
+                <div style="color:#6b6b76;font-size:10px;">v5.5</div>
                 <button id="gm-hide" type="button" title="Скрыть панель на этом сайте"
                         style="padding:2px 8px;background:#333;color:#fff;border:0;border-radius:6px;cursor:pointer;font-size:13px;line-height:1;">–</button>
             </div>
@@ -247,8 +250,12 @@
         regBtn.style.cursor = v ? 'wait' : 'pointer';
     }
 
+    function logBlocks() {
+        return log ? log.split(/\n{2,}/).filter(b => b.trim()) : [];
+    }
+
     function appendLog(login, pass) {
-        const blocks = log ? log.split(/\n{2,}/).filter(b => b.trim()) : [];
+        const blocks = logBlocks();
         const exists = blocks.some(b => b.split('\n')[0].trim() === login);
         if (!exists) {
             blocks.push(login + '\n' + pass);
@@ -260,12 +267,37 @@
         updateLogLabel();
     }
 
+    function loginInOutput(login) {
+        return logBlocks().some(b => b.split('\n')[0].trim() === login);
+    }
+
+    function saveManualTrack() {
+        GM_setValue('manualTrack', manualTrack);
+    }
+
+    function scrapeEmailFromPage() {
+        const m = ((document.body && document.body.innerText) || '').match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/);
+        return m ? m[0] : '';
+    }
+
+    function syncCounterTo(login) {
+        const nxt = nextValue(login);
+        if (current !== nxt) {
+            current = nxt;
+            GM_setValue('current', current);
+            syncTextarea();
+            updateLabels();
+        }
+    }
+
     // ===== ожидание / подтверждение =====
     function clearPending() {
         pending = null;
         GM_setValue('pending', null);
         stopErrorObserver();
         setRegBusy(false);
+        manualTrack.signupTime = 0; // гасим, чтобы детект ручных не сработал вслед за скриптовым потоком
+        saveManualTrack();
     }
 
     function commitPending() {
@@ -283,17 +315,15 @@
     function failPending(text) {
         if (!pending) return;
         clearPending();
-        const short = norm(text).slice(0, 90);
-        flash('Не создано: ' + short + ' — счётчик не увеличен, в отдачу не записано', false);
+        flash('Не создано: ' + norm(text).slice(0, 90) + ' — счётчик не увеличен, в отдачу не записано', false);
     }
 
     function watchPending() {
         if (!pending) return;
         if (CONFIG.successUrlPattern.test(location.pathname)) { commitPending(); return; }
         if (Date.now() - pending.time >= CONFIG.successWaitMs) {
-            if (CONFIG.commitOnTimeout) {
-                commitPending();
-            } else {
+            if (CONFIG.commitOnTimeout) commitPending();
+            else {
                 const login = pending.login;
                 clearPending();
                 flash('Не подтверждено: ' + login + ' — проверь вручную, в отдачу не записано', false);
@@ -301,7 +331,6 @@
         }
     }
 
-    // Запоминаем сообщения, которые уже висят на странице (чтобы не принять старую ошибку за новую).
     function captureStaleMessages() {
         const set = new Set();
         for (const el of document.querySelectorAll(ERROR_SELECTORS + ',' + SUCCESS_SELECTORS)) {
@@ -315,7 +344,6 @@
 
     function scanDomMessages() {
         if (!pending) return;
-        // Ошибки — только НОВЫЕ (старые игнорируем). Ошибка приоритетнее успеха.
         for (const el of document.querySelectorAll(ERROR_SELECTORS)) {
             if (panel.contains(el) || badge.contains(el) || staleMsgEls.has(el)) continue;
             if (!el.getClientRects().length) continue;
@@ -323,7 +351,6 @@
             if (!txt || txt.length > 400) continue;
             if (CONFIG.errorText.test(txt)) { failPending(txt); return; }
         }
-        // Успех по сообщению — тоже только новый.
         for (const el of document.querySelectorAll(SUCCESS_SELECTORS)) {
             if (panel.contains(el) || badge.contains(el) || staleMsgEls.has(el)) continue;
             if (!el.getClientRects().length) continue;
@@ -405,6 +432,42 @@
         w.addEventListener(evt, (e) => onSiteAlert(String((e && e.detail) || '')));
     })();
 
+    // ===== детект РУЧНЫХ регистраций =====
+    function trackManual() {
+        if (!CONFIG.trackManual) return;
+        const now = Date.now();
+        let changed = false;
+        if (onSignupPage() && now - manualTrack.signupTime > 1000) {
+            manualTrack.signupTime = now;
+            changed = true;
+        }
+        const li = findLoginInput();
+        if (li && li.value && li.value.trim() !== manualTrack.login) {
+            manualTrack.login = li.value.trim();
+            manualTrack.loginTime = now;
+            changed = true;
+        }
+        if (changed) saveManualTrack();
+    }
+
+    function watchManualSuccess() {
+        if (!CONFIG.trackManual) return;
+        if (pending) return; // скриптовый поток обрабатывает сам
+        if (!CONFIG.successUrlPattern.test(location.pathname)) return;
+        const now = Date.now();
+        if (!manualTrack.signupTime || now - manualTrack.signupTime > CONFIG.manualWindowMs) return;
+
+        const login = manualTrack.login || scrapeEmailFromPage() || current;
+        manualTrack.signupTime = 0; // сработало один раз
+        saveManualTrack();
+        if (!login) return;
+
+        if (loginInOutput(login)) { syncCounterTo(login); return; }
+        appendLog(login, password);
+        syncCounterTo(login);
+        flash('Ручная регистрация ✓ ' + login + ' → в отдаче, счётчик +1');
+    }
+
     // ===== обработчики панели =====
     ta.addEventListener('input', () => {
         const lines = ta.value.split(/\r?\n/);
@@ -472,7 +535,7 @@
             const btn = findSubmitButton();
             if (!btn) { flash('Кнопка не найдена — проверь CONFIG.submitSelector', false); return; }
             if (btn.disabled) { flash('Кнопка неактивна — проверь поля', false); return; }
-            staleMsgEls = captureStaleMessages(); // всё, что висит сейчас — считаем старым
+            staleMsgEls = captureStaleMessages();
             pending = { login: usedLogin, pass: usedPass, time: Date.now() };
             GM_setValue('pending', pending);
             setRegBusy(true);
@@ -530,12 +593,11 @@
         flash('Отдача очищена');
     });
 
-    // Если страница перезагрузилась с незавершённым ожиданием — восстанавливаем его.
     if (pending) {
         if (CONFIG.successUrlPattern.test(location.pathname)) {
-            commitPending(); // приехали на success-URL после перезагрузки → засчитываем
+            commitPending();
         } else if (Date.now() - pending.time > CONFIG.successWaitMs + 2000) {
-            clearPending(); // ожидание протухло
+            clearPending();
         } else {
             staleMsgEls = captureStaleMessages();
             setRegBusy(true);
@@ -549,6 +611,8 @@
         if (!document.body.contains(badge)) document.body.appendChild(badge);
         watchPending();
         scanDomMessages();
+        trackManual();
+        watchManualSuccess();
         if (autoNav && Date.now() - lastAutoNav > 3000 && !onSignupPage() && findSignupLink()) {
             lastAutoNav = Date.now();
             goToSignup(true);
