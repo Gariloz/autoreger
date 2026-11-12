@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         autoreger
 // @namespace    http://tampermonkey.net/
-// @version      5.5
-// @description  Автозаполнитель регистрации: инкремент, пароль в оба поля, отдача подтверждённых, детект ручных регистраций, без дублей
+// @version      5.6
+// @description  Автозаполнитель регистрации: инкремент, пароль в оба поля, отдача подтверждённых, детект ручных регистраций (переход и перезагрузка), без дублей
 // @match        *://*/*
 // @noframes
 // @grant        GM_getValue
@@ -39,9 +39,8 @@
         successWaitMs: 8000,
         commitOnTimeout: false,
 
-        // Ловить РУЧНЫЕ регистрации (кнопка сайта, не панели) и писать их в отдачу +1.
         trackManual: true,
-        manualWindowMs: 60000, // окно (мс): success вскоре после страницы регистрации = это регистрация
+        manualWindowMs: 60000,
 
         errorText: /already\s*(exists|registered|in\s*use|taken)|уже\s*(существует|зарегистрирован|занят)|\bexists\b|\btaken\b|duplicate|дубликат|invalid|неверн|некоррект|ошибк|\berror\b|failed|failure|не\s*удалось|unable|невозможн|rejected|отклонен|denied|too\s*many|слишком\s*много|try\s*again|rate[\s-]*limit|лимит|превышен|попробуйте\s*(позже|завтра)|повторите\s*попытку|captcha|каптч|blocked|заблокирован|suspended|ограничен/i,
         successText: /account\s*created|registration\s*complete|successfully\s*(registered|created)|welcome|успешн|зарегистрирован|добро\s*пожаловать|аккаунт\s*создан/i,
@@ -67,6 +66,9 @@
     let registering = false;
     let observer = null;
     let staleMsgEls = new Set();
+    let prevPathname = location.pathname;
+    let manualDone = false;
+    let justCommitted = false;
 
     function nextValue(str) {
         const at = str.indexOf('@');
@@ -138,7 +140,7 @@
         <div style="display:flex;align-items:center;justify-content:space-between;">
             <div style="color:#e4e4ec;font-size:12px;font-weight:bold;letter-spacing:2px;text-transform:uppercase;">autoreger</div>
             <div style="display:flex;align-items:center;gap:6px;">
-                <div style="color:#6b6b76;font-size:10px;">v5.5</div>
+                <div style="color:#6b6b76;font-size:10px;">v5.6</div>
                 <button id="gm-hide" type="button" title="Скрыть панель на этом сайте"
                         style="padding:2px 8px;background:#333;color:#fff;border:0;border-radius:6px;cursor:pointer;font-size:13px;line-height:1;">–</button>
             </div>
@@ -280,29 +282,20 @@
         return m ? m[0] : '';
     }
 
-    function syncCounterTo(login) {
-        const nxt = nextValue(login);
-        if (current !== nxt) {
-            current = nxt;
-            GM_setValue('current', current);
-            syncTextarea();
-            updateLabels();
-        }
-    }
-
     // ===== ожидание / подтверждение =====
     function clearPending() {
         pending = null;
         GM_setValue('pending', null);
         stopErrorObserver();
         setRegBusy(false);
-        manualTrack.signupTime = 0; // гасим, чтобы детект ручных не сработал вслед за скриптовым потоком
+        manualTrack.signupTime = 0;
         saveManualTrack();
     }
 
     function commitPending() {
         if (!pending) return;
         const { login, pass } = pending;
+        justCommitted = true; // чтобы детект ручных не сработал вслед за скриптовым успехом
         clearPending();
         current = nextValue(login);
         GM_setValue('current', current);
@@ -437,9 +430,10 @@
         if (!CONFIG.trackManual) return;
         const now = Date.now();
         let changed = false;
-        if (onSignupPage() && now - manualTrack.signupTime > 1000) {
-            manualTrack.signupTime = now;
-            changed = true;
+        if (onSignupPage()) {
+            justCommitted = false;
+            manualDone = false;
+            if (now - manualTrack.signupTime > 1000) { manualTrack.signupTime = now; changed = true; }
         }
         const li = findLoginInput();
         if (li && li.value && li.value.trim() !== manualTrack.login) {
@@ -450,23 +444,41 @@
         if (changed) saveManualTrack();
     }
 
-    function watchManualSuccess() {
-        if (!CONFIG.trackManual) return;
-        if (pending) return; // скриптовый поток обрабатывает сам
-        if (!CONFIG.successUrlPattern.test(location.pathname)) return;
-        const now = Date.now();
-        if (!manualTrack.signupTime || now - manualTrack.signupTime > CONFIG.manualWindowMs) return;
-
-        const login = manualTrack.login || scrapeEmailFromPage() || current;
-        manualTrack.signupTime = 0; // сработало один раз
+    function tryManualSuccess(fromReload) {
+        if (!CONFIG.trackManual || pending || justCommitted || manualDone) return;
+        if (fromReload) {
+            const now = Date.now();
+            if (!manualTrack.signupTime || now - manualTrack.signupTime > CONFIG.manualWindowMs) return;
+        }
+        const candidates = [manualTrack.login, scrapeEmailFromPage(), current];
+        let login = '';
+        for (const c of candidates) { if (c && !loginInOutput(c)) { login = c; break; } }
+        manualTrack.signupTime = 0;
         saveManualTrack();
+        manualDone = true;
         if (!login) return;
-
-        if (loginInOutput(login)) { syncCounterTo(login); return; }
         appendLog(login, password);
-        syncCounterTo(login);
-        flash('Ручная регистрация ✓ ' + login + ' → в отдаче, счётчик +1');
+        current = nextValue(login);
+        GM_setValue('current', current);
+        syncTextarea();
+        updateLabels();
+        flash('Ручная регистрация ✓ ' + login + ' → отдача и +1');
     }
+
+    function detectManualTransition() {
+        const nowPath = location.pathname;
+        if (nowPath !== prevPathname) {
+            const wasSignup = CONFIG.signupPagePattern.test(prevPathname);
+            const nowSuccess = CONFIG.successUrlPattern.test(nowPath);
+            prevPathname = nowPath;
+            if (wasSignup && nowSuccess) tryManualSuccess(false);
+        }
+    }
+
+    window.addEventListener('beforeunload', saveManualTrack);
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') saveManualTrack();
+    });
 
     // ===== обработчики панели =====
     ta.addEventListener('input', () => {
@@ -606,13 +618,16 @@
         }
     }
 
+    // Загрузка сразу на success-странице вскоре после регистрации = ручная регистрация с перезагрузкой.
+    if (CONFIG.successUrlPattern.test(location.pathname)) tryManualSuccess(true);
+
     setInterval(() => {
         if (!document.body.contains(panel)) document.body.appendChild(panel);
         if (!document.body.contains(badge)) document.body.appendChild(badge);
         watchPending();
         scanDomMessages();
         trackManual();
-        watchManualSuccess();
+        detectManualTransition();
         if (autoNav && Date.now() - lastAutoNav > 3000 && !onSignupPage() && findSignupLink()) {
             lastAutoNav = Date.now();
             goToSignup(true);
