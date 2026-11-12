@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         autoreger
 // @namespace    http://tampermonkey.net/
-// @version      4.4
-// @description  1-я строка логин (автоинкремент), 2-я пароль; Create account; окно отдачи с копированием
-// @match        https://app.trysixth.com/*
+// @version      5.0
+// @description  Универсальный автозаполнитель форм регистрации: логин с автоинкрементом, пароль в оба поля, клик по кнопке, окно отдачи
+// @match        *://*/*
+// @noframes
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_setClipboard
@@ -13,11 +14,55 @@
 (function () {
     'use strict';
 
+    /* ============================================================
+       CONFIG — ЕДИНСТВЕННОЕ МЕСТО, КОТОРОЕ МЕНЯЕТСЯ ПОД СВОЙ САЙТ
+       Замени селекторы на те, что есть на целевой странице.
+       ============================================================ */
+    const CONFIG = {
+        // Поле логина/email. Селекторы пробуются по очереди, берётся первое найденное.
+        loginSelectors: [
+            'input[type="email"]',
+            'input[name="email"]',
+            'input[autocomplete="username"]',
+            'input[name*="login"]',
+            'input[id*="login"]',
+        ],
+
+        // Поля пароля. Заполняются ВСЕ найденные (пароль + повтор).
+        passwordSelector: 'input[type="password"]',
+
+        // Кнопка отправки формы.
+        submitSelector: 'button[type="submit"], input[type="submit"]',
+        // Запасной поиск кнопки по тексту (если селекторов несколько).
+        submitText: /create\s*account|sign\s*up|register|join|зарегистрир|создать\s*аккаунт|регистрац/i,
+
+        // Ссылка на страницу регистрации (для авто-возврата).
+        signupLinkSelectors: [
+            'a[href*="signup"]',
+            'a[href*="register"]',
+            'a[href*="registration"]',
+        ],
+        signupLinkText: /create\s*an?\s*account|sign\s*up|register|регистрац/i,
+
+        // Как понять, что ты уже на странице регистрации (авто-возврат туда не кликает).
+        signupPagePattern: /sign[-_]?up|register|registration/i,
+
+        // Запасной прямой адрес регистрации, если ссылка не найдена. Пусто = не переходить.
+        signupUrl: '',
+
+        // Пауза между заполнением полей и кликом по кнопке (мс), чтобы форма успела принять значения.
+        submitDelay: 300,
+    };
+    /* ============================================================ */
+
+    const hostKey = location.host;
+
     let template = GM_getValue('template', '');      // запомненное вручную (для ↺)
     let current  = GM_getValue('current', template); // что вставится следующим
     let password = GM_getValue('password', '');
     let log      = GM_getValue('log', '');           // отдача
-    let autoNav  = GM_getValue('autoNav', true);
+    let autoNav  = GM_getValue('autoNav_' + hostKey, false); // авто-возврат (на каждый сайт свой)
+    let hidden   = GM_getValue('hidden_' + hostKey, false);  // видимость панели (на каждый сайт своя)
     let lastAutoNav = 0;
     let flashTimer = null;
     let registering = false;
@@ -35,7 +80,7 @@
         return local + '1' + domain;
     }
 
-    // React-совместимая установка значения
+    // совместимая с React/Vue установка значения
     function setNativeValue(input, value) {
         const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
         setter.call(input, value);
@@ -43,45 +88,50 @@
         input.dispatchEvent(new Event('change', { bubbles: true }));
     }
 
-    function findEmailInput() {
-        return document.querySelector('input[type="email"]')
-            || document.querySelector('input[placeholder="you@company.com"]');
-    }
-
-    function findPasswordInputs() {
-        return [...document.querySelectorAll('input[type="password"]')]
-            .filter(i => !panel.contains(i));
-    }
-
-    function findSignupLink() {
-        return document.querySelector('a[href*="/vscode/signup"]')
-            || [...document.querySelectorAll('a')].find(a => /create an account/i.test(a.textContent));
-    }
-
-    function findSubmitButton() {
-        const byClass = document.querySelector('button[type="submit"].sd-btn-accent');
-        if (byClass && !panel.contains(byClass)) return byClass;
-        const byText = [...document.querySelectorAll('button[type="submit"]')]
-            .find(b => !panel.contains(b) && /create\s*account/i.test(b.textContent));
-        if (byText) return byText;
-        if (onSignupPage()) {
-            return [...document.querySelectorAll('button[type="submit"]')]
-                .find(b => !panel.contains(b)) || null;
+    function findLoginInput() {
+        for (const sel of CONFIG.loginSelectors) {
+            const el = [...document.querySelectorAll(sel)].find(i => !panel.contains(i));
+            if (el) return el;
         }
         return null;
     }
 
+    function findPasswordInputs() {
+        return [...document.querySelectorAll(CONFIG.passwordSelector)]
+            .filter(i => !panel.contains(i));
+    }
+
+    function findSubmitButton() {
+        const candidates = [...document.querySelectorAll(CONFIG.submitSelector)]
+            .filter(b => !panel.contains(b));
+        return candidates.find(b => CONFIG.submitText.test(b.textContent || b.value || ''))
+            || candidates[0] || null;
+    }
+
+    function findSignupLink() {
+        for (const sel of CONFIG.signupLinkSelectors) {
+            const el = document.querySelector(sel);
+            if (el && !panel.contains(el)) return el;
+        }
+        return [...document.querySelectorAll('a')]
+            .find(a => !panel.contains(a) && CONFIG.signupLinkText.test(a.textContent)) || null;
+    }
+
     function onSignupPage() {
-        return location.pathname.includes('/vscode/signup');
+        return CONFIG.signupPagePattern.test(location.href);
     }
 
     // ===== панель =====
     const style = document.createElement('style');
     style.textContent = `
-        #gm-panel button { transition: transform .1s ease, filter .15s ease; }
-        #gm-panel button:hover { filter: brightness(1.15); }
-        #gm-panel button:active { transform: scale(.96); }
+        #gm-panel button, #gm-badge { transition: transform .1s ease, filter .15s ease; }
+        #gm-panel button:hover, #gm-badge:hover { filter: brightness(1.15); }
+        #gm-panel button:active, #gm-badge:active { transform: scale(.96); }
         #gm-panel textarea:focus { border-color: #4f46e5 !important; }
+        #gm-panel::-webkit-scrollbar, #gm-panel textarea::-webkit-scrollbar { width: 8px; }
+        #gm-panel::-webkit-scrollbar-track, #gm-panel textarea::-webkit-scrollbar-track { background: #111; }
+        #gm-panel::-webkit-scrollbar-thumb, #gm-panel textarea::-webkit-scrollbar-thumb { background: #3a3a44; border-radius: 4px; }
+        #gm-panel::-webkit-scrollbar-thumb:hover, #gm-panel textarea::-webkit-scrollbar-thumb:hover { background: #4f46e5; }
     `;
     document.head.appendChild(style);
 
@@ -92,7 +142,11 @@
         <div style="height:3px;border-radius:2px;background:linear-gradient(90deg,#4f46e5,#22d3ee,#16a34a);"></div>
         <div style="display:flex;align-items:center;justify-content:space-between;">
             <div style="color:#e4e4ec;font-size:12px;font-weight:bold;letter-spacing:2px;text-transform:uppercase;">autoreger</div>
-            <div style="color:#6b6b76;font-size:10px;">v4.4</div>
+            <div style="display:flex;align-items:center;gap:6px;">
+                <div style="color:#6b6b76;font-size:10px;">v5.0</div>
+                <button id="gm-hide" type="button" title="Скрыть панель на этом сайте"
+                        style="padding:2px 8px;background:#333;color:#fff;border:0;border-radius:6px;cursor:pointer;font-size:13px;line-height:1;">–</button>
+            </div>
         </div>
 
         <div style="color:#9a9aa5;font-size:11px;text-transform:uppercase;">Логин + пароль (2 строки)</div>
@@ -118,7 +172,7 @@
         <div style="border-top:1px solid #3a3a44;margin:4px 0;"></div>
 
         <div style="color:#9a9aa5;font-size:11px;text-transform:uppercase;">Регистрация</div>
-        <button id="gm-register" type="button" title="Логин + пароль + клик по Create account"
+        <button id="gm-register" type="button" title="Логин + пароль + клик по кнопке регистрации"
                 style="padding:9px;background:#d97706;color:#fff;border:0;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold;">Создать аккаунт →</button>
         <label style="display:flex;align-items:center;gap:6px;color:#9a9aa5;font-size:12px;cursor:pointer;">
             <input id="gm-auto" type="checkbox" style="accent-color:#4f46e5;cursor:pointer;">
@@ -141,6 +195,15 @@
     `;
     document.body.appendChild(panel);
 
+    // маленькая кнопка-бейдж, когда панель скрыта
+    const badge = document.createElement('button');
+    badge.id = 'gm-badge';
+    badge.type = 'button';
+    badge.textContent = '⚡ autoreger';
+    badge.title = 'Показать панель';
+    badge.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:999999;padding:8px 14px;background:#1c1c22;color:#e4e4ec;border:1px solid #4f46e5;border-radius:20px;cursor:pointer;font-size:12px;font-family:sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.5);display:none;';
+    document.body.appendChild(badge);
+
     const ta        = panel.querySelector('#gm-creds');
     const nextLabel = panel.querySelector('#gm-next');
     const memLabel  = panel.querySelector('#gm-mem');
@@ -151,6 +214,14 @@
     autoChk.checked = autoNav;
     logTa.value = log;
     logTa.scrollTop = logTa.scrollHeight;
+
+    function setHidden(v) {
+        hidden = v;
+        GM_setValue('hidden_' + hostKey, v);
+        panel.style.display = v ? 'none' : 'flex';
+        badge.style.display = v ? 'flex' : 'none';
+    }
+    setHidden(hidden);
 
     function syncTextarea() {
         ta.value = (current || password) ? current + '\n' + password : '';
@@ -203,15 +274,15 @@
 
     autoChk.addEventListener('change', () => {
         autoNav = autoChk.checked;
-        GM_setValue('autoNav', autoNav);
+        GM_setValue('autoNav_' + hostKey, autoNav);
         flash(autoNav ? 'Авто-возврат включён' : 'Авто-возврат выключен');
     });
 
     // возвращает вставленный логин (строку) или false
     function insertLogin(silent) {
         if (!current) { flash('Введи логин в 1-й строке', false); ta.focus(); return false; }
-        const input = findEmailInput();
-        if (!input) { flash('Поле email на странице не найдено', false); return false; }
+        const input = findLoginInput();
+        if (!input) { flash('Поле логина не найдено — проверь CONFIG.loginSelectors', false); return false; }
         const value = current;
         input.focus();
         setNativeValue(input, value);
@@ -227,13 +298,13 @@
     function insertPassword(silent) {
         if (!password) { flash('Введи пароль во 2-й строке', false); ta.focus(); return false; }
         const inputs = findPasswordInputs();
-        if (!inputs.length) { flash('Поля пароля на странице не найдены', false); return false; }
+        if (!inputs.length) { flash('Поля пароля не найдены — проверь CONFIG.passwordSelector', false); return false; }
         inputs.forEach(i => setNativeValue(i, password));
         if (!silent) flash('Пароль вставлен в оба поля');
         return true;
     }
 
-    // логин + пароль + клик по Create account + запись в отдачу
+    // логин + пароль + клик по кнопке регистрации + запись в отдачу
     function registerAccount() {
         if (registering) return;
         const usedLogin = insertLogin(true);
@@ -242,16 +313,16 @@
         const usedPass = password;
 
         registering = true;
-        flash('Поля заполнены, жму Create account…');
+        flash('Поля заполнены, жму кнопку регистрации…');
         setTimeout(() => {
             registering = false;
             const btn = findSubmitButton();
-            if (!btn) { flash('Кнопка Create account не найдена', false); return; }
-            if (btn.disabled) { flash('Create account неактивна — проверь поля', false); return; }
+            if (!btn) { flash('Кнопка не найдена — проверь CONFIG.submitSelector', false); return; }
+            if (btn.disabled) { flash('Кнопка неактивна — проверь поля', false); return; }
             btn.click();
             appendLog(usedLogin, usedPass);
-            flash('Create account нажата ✓ записано в отдачу');
-        }, 300);
+            flash('Кнопка нажата ✓ записано в отдачу');
+        }, CONFIG.submitDelay);
     }
 
     function goToSignup(auto) {
@@ -261,14 +332,16 @@
             flash(auto ? 'Авто-возврат на регистрацию…' : 'Переход к регистрации…');
             return true;
         }
-        if (!onSignupPage()) {
-            location.href = '/vscode/signup' + location.search;
+        if (CONFIG.signupUrl && !onSignupPage()) {
+            location.href = CONFIG.signupUrl;
             return true;
         }
-        if (!auto) flash('Ссылка не найдена — ты уже на регистрации', false);
+        if (!auto) flash('Ссылка на регистрацию не найдена', false);
         return false;
     }
 
+    panel.querySelector('#gm-hide').addEventListener('click', () => setHidden(true));
+    badge.addEventListener('click', () => setHidden(false));
     panel.querySelector('#gm-ins-login').addEventListener('click', () => insertLogin(false));
     panel.querySelector('#gm-ins-pass').addEventListener('click', () => insertPassword(false));
     panel.querySelector('#gm-ins-all').addEventListener('click', () => {
@@ -303,6 +376,7 @@
     // возврат панели после перерисовки SPA + авто-возврат на регистрацию
     setInterval(() => {
         if (!document.body.contains(panel)) document.body.appendChild(panel);
+        if (!document.body.contains(badge)) document.body.appendChild(badge);
 
         if (autoNav && Date.now() - lastAutoNav > 3000 && !onSignupPage() && findSignupLink()) {
             lastAutoNav = Date.now();
