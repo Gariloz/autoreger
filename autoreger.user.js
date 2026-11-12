@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         autoreger
 // @namespace    http://tampermonkey.net/
-// @version      5.2
-// @description  Универсальный автозаполнитель регистрации: инкремент логина, пароль в оба поля, клик по кнопке, отдача только подтверждённых аккаунтов, без дублей
+// @version      5.4
+// @description  Универсальный автозаполнитель регистрации: инкремент логина, пароль в оба поля, отдача только подтверждённых аккаунтов, без дублей и без залипания ошибок
 // @match        *://*/*
 // @noframes
 // @grant        GM_getValue
@@ -35,19 +35,20 @@
         signupUrl: '',
         submitDelay: 300,
 
-        // Сколько ждать подтверждения успеха после клика (мс).
+        // Флаг успеха: путь URL после успешной регистрации (пример: /signup -> /onboarding).
+        successUrlPattern: /\/onboarding|\/welcome|\/dashboard|\/success|registration[-_]?complete/i,
+
         successWaitMs: 8000,
-        // Если сайт НЕ редиректит и не показывает сообщение об успехе —
-        // поставь true, чтобы считать успехом по истечении ожидания.
-        // По умолчанию false = безопаснее (неудачные не попадают в отдачу).
         commitOnTimeout: false,
 
-        // Фразы-ОШИБКИ → аккаунт не создан, в отдачу НЕ писать, счётчик НЕ увеличивать.
         errorText: /already\s*(exists|registered|in\s*use|taken)|уже\s*(существует|зарегистрирован|занят)|\bexists\b|\btaken\b|duplicate|дубликат|invalid|неверн|некоррект|ошибк|\berror\b|failed|failure|не\s*удалось|unable|невозможн|rejected|отклонен|denied|too\s*many|слишком\s*много|try\s*again|rate[\s-]*limit|лимит|превышен|попробуйте\s*(позже|завтра)|повторите\s*попытку|captcha|каптч|blocked|заблокирован|suspended|ограничен/i,
-        // Фразы-УСПЕХА → подтверждение создания.
-        successText: /success|created|welcome|успеш|создан|добро\s*пожаловать|готово|account\s*created|registration\s*complete/i,
+        successText: /account\s*created|registration\s*complete|successfully\s*(registered|created)|welcome|успешн|зарегистрирован|добро\s*пожаловать|аккаунт\s*создан/i,
     };
     /* ============================================================ */
+
+    const ERROR_SELECTORS = '[role="alert"],[role="status"],[class*="error"],[class*="alert"],[class*="toast"],[class*="notification"],[class*="message"],[class*="danger"],[style*="danger"],[data-error]';
+    const SUCCESS_SELECTORS = '[role="status"],[class*="success"],[class*="message"],[class*="toast"],[class*="notification"]';
+    const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
 
     const hostKey = location.host;
 
@@ -57,10 +58,12 @@
     let log      = GM_getValue('log', '');
     let autoNav  = GM_getValue('autoNav_' + hostKey, false);
     let hidden   = GM_getValue('hidden_' + hostKey, false);
+    let pending  = GM_getValue('pending', null); // переживает перезагрузку страницы
     let lastAutoNav = 0;
     let flashTimer = null;
     let registering = false;
-    let pending = null; // { login, pass, time, startUrl }
+    let observer = null;
+    let staleMsgEls = new Set(); // сообщения, которые были на странице ДО клика (их игнорируем)
 
     function nextValue(str) {
         const at = str.indexOf('@');
@@ -107,7 +110,7 @@
     }
 
     function onSignupPage() {
-        return CONFIG.signupPagePattern.test(location.href);
+        return CONFIG.signupPagePattern.test(location.pathname);
     }
 
     // ===== панель =====
@@ -132,7 +135,7 @@
         <div style="display:flex;align-items:center;justify-content:space-between;">
             <div style="color:#e4e4ec;font-size:12px;font-weight:bold;letter-spacing:2px;text-transform:uppercase;">autoreger</div>
             <div style="display:flex;align-items:center;gap:6px;">
-                <div style="color:#6b6b76;font-size:10px;">v5.2</div>
+                <div style="color:#6b6b76;font-size:10px;">v5.4</div>
                 <button id="gm-hide" type="button" title="Скрыть панель на этом сайте"
                         style="padding:2px 8px;background:#333;color:#fff;border:0;border-radius:6px;cursor:pointer;font-size:13px;line-height:1;">–</button>
             </div>
@@ -244,7 +247,6 @@
         regBtn.style.cursor = v ? 'wait' : 'pointer';
     }
 
-    // Запись в отдачу с защитой от дублей (один логин — одна запись).
     function appendLog(login, pass) {
         const blocks = log ? log.split(/\n{2,}/).filter(b => b.trim()) : [];
         const exists = blocks.some(b => b.split('\n')[0].trim() === login);
@@ -258,12 +260,18 @@
         updateLogLabel();
     }
 
-    // ===== подтверждение / отклонение регистрации =====
+    // ===== ожидание / подтверждение =====
+    function clearPending() {
+        pending = null;
+        GM_setValue('pending', null);
+        stopErrorObserver();
+        setRegBusy(false);
+    }
+
     function commitPending() {
         if (!pending) return;
         const { login, pass } = pending;
-        pending = null;
-        setRegBusy(false);
+        clearPending();
         current = nextValue(login);
         GM_setValue('current', current);
         syncTextarea();
@@ -274,48 +282,99 @@
 
     function failPending(text) {
         if (!pending) return;
-        pending = null;
-        setRegBusy(false);
-        const short = String(text).replace(/\s+/g, ' ').trim().slice(0, 90);
+        clearPending();
+        const short = norm(text).slice(0, 90);
         flash('Не создано: ' + short + ' — счётчик не увеличен, в отдачу не записано', false);
     }
 
     function watchPending() {
         if (!pending) return;
-        // Уход со страницы регистрации (редирект) = успех.
-        if (location.href !== pending.startUrl) { commitPending(); return; }
+        if (CONFIG.successUrlPattern.test(location.pathname)) { commitPending(); return; }
         if (Date.now() - pending.time >= CONFIG.successWaitMs) {
             if (CONFIG.commitOnTimeout) {
                 commitPending();
             } else {
                 const login = pending.login;
-                pending = null;
-                setRegBusy(false);
+                clearPending();
                 flash('Не подтверждено: ' + login + ' — проверь вручную, в отдачу не записано', false);
             }
         }
     }
 
-    function scanDomMessages() {
-        if (!pending) return;
-        const sels = '[role="alert"],[role="status"],[class*="error"],[class*="alert"],[class*="toast"],[class*="notification"],[class*="message"],[class*="success"],[data-error]';
-        for (const el of document.querySelectorAll(sels)) {
+    // Запоминаем сообщения, которые уже висят на странице (чтобы не принять старую ошибку за новую).
+    function captureStaleMessages() {
+        const set = new Set();
+        for (const el of document.querySelectorAll(ERROR_SELECTORS + ',' + SUCCESS_SELECTORS)) {
             if (panel.contains(el) || badge.contains(el)) continue;
             if (!el.getClientRects().length) continue;
-            const txt = (el.textContent || '').replace(/\s+/g, ' ').trim();
-            if (!txt || txt.length > 300) continue;
-            if (CONFIG.errorText.test(txt) && !CONFIG.successText.test(txt)) { failPending(txt); return; }
-            if (CONFIG.successText.test(txt)) { commitPending(); return; }
+            const txt = norm(el.textContent);
+            if (txt && txt.length <= 400 && (CONFIG.errorText.test(txt) || CONFIG.successText.test(txt))) set.add(el);
         }
+        return set;
+    }
+
+    function scanDomMessages() {
+        if (!pending) return;
+        // Ошибки — только НОВЫЕ (старые игнорируем). Ошибка приоритетнее успеха.
+        for (const el of document.querySelectorAll(ERROR_SELECTORS)) {
+            if (panel.contains(el) || badge.contains(el) || staleMsgEls.has(el)) continue;
+            if (!el.getClientRects().length) continue;
+            const txt = norm(el.textContent);
+            if (!txt || txt.length > 400) continue;
+            if (CONFIG.errorText.test(txt)) { failPending(txt); return; }
+        }
+        // Успех по сообщению — тоже только новый.
+        for (const el of document.querySelectorAll(SUCCESS_SELECTORS)) {
+            if (panel.contains(el) || badge.contains(el) || staleMsgEls.has(el)) continue;
+            if (!el.getClientRects().length) continue;
+            const txt = norm(el.textContent);
+            if (txt && txt.length <= 400 && CONFIG.successText.test(txt) && !CONFIG.errorText.test(txt)) { commitPending(); return; }
+        }
+    }
+
+    function nodeHasError(node) {
+        if (!pending) return false;
+        const el = node.nodeType === 1 ? node : (node.parentElement || null);
+        if (!el || panel.contains(el) || badge.contains(el) || staleMsgEls.has(el)) return false;
+        const txt = norm(el.textContent);
+        if (txt && txt.length <= 400) {
+            if (CONFIG.errorText.test(txt)) { failPending(txt); return true; }
+            return false;
+        }
+        if (el.querySelectorAll) {
+            const list = el.querySelectorAll('div,span,p,li,[role="alert"]');
+            for (let i = 0; i < list.length && i < 100; i++) {
+                const s = list[i];
+                if (panel.contains(s) || badge.contains(s) || staleMsgEls.has(s)) continue;
+                const t = norm(s.textContent);
+                if (t && t.length <= 400 && CONFIG.errorText.test(t) && s.getClientRects().length) { failPending(t); return true; }
+            }
+        }
+        return false;
+    }
+
+    function startErrorObserver() {
+        stopErrorObserver();
+        observer = new MutationObserver((muts) => {
+            if (!pending) return;
+            for (const m of muts) {
+                for (const n of m.addedNodes) { if (nodeHasError(n)) return; }
+                if (m.type === 'characterData' && nodeHasError(m.target)) return;
+            }
+        });
+        observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+    }
+
+    function stopErrorObserver() {
+        if (observer) { observer.disconnect(); observer = null; }
     }
 
     function onSiteAlert(text) {
         if (!pending) return;
-        if (CONFIG.errorText.test(text) && !CONFIG.successText.test(text)) failPending(text);
-        else if (CONFIG.successText.test(text)) commitPending();
+        if (CONFIG.errorText.test(text)) { failPending(text); return; }
+        if (CONFIG.successText.test(text)) { commitPending(); }
     }
 
-    // Перехват alert() сайта — работает и в песочнице, и в контексте страницы.
     (function installAlertHook() {
         const w = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
         const evt = '__autoreger_alert';
@@ -391,7 +450,6 @@
         return true;
     }
 
-    // Регистрация: заполнить → клик → ждать подтверждения. В отдачу — только успех.
     function registerAccount() {
         if (registering || pending) return;
         if (!current) { flash('Введи логин в 1-й строке', false); ta.focus(); return; }
@@ -414,8 +472,11 @@
             const btn = findSubmitButton();
             if (!btn) { flash('Кнопка не найдена — проверь CONFIG.submitSelector', false); return; }
             if (btn.disabled) { flash('Кнопка неактивна — проверь поля', false); return; }
-            pending = { login: usedLogin, pass: usedPass, time: Date.now(), startUrl: location.href };
+            staleMsgEls = captureStaleMessages(); // всё, что висит сейчас — считаем старым
+            pending = { login: usedLogin, pass: usedPass, time: Date.now() };
+            GM_setValue('pending', pending);
             setRegBusy(true);
+            startErrorObserver();
             flash('Отправлено, жду ответ сайта…');
             btn.click();
         }, CONFIG.submitDelay);
@@ -468,6 +529,20 @@
         updateLogLabel();
         flash('Отдача очищена');
     });
+
+    // Если страница перезагрузилась с незавершённым ожиданием — восстанавливаем его.
+    if (pending) {
+        if (CONFIG.successUrlPattern.test(location.pathname)) {
+            commitPending(); // приехали на success-URL после перезагрузки → засчитываем
+        } else if (Date.now() - pending.time > CONFIG.successWaitMs + 2000) {
+            clearPending(); // ожидание протухло
+        } else {
+            staleMsgEls = captureStaleMessages();
+            setRegBusy(true);
+            startErrorObserver();
+            flash('Жду ответ сайта…');
+        }
+    }
 
     setInterval(() => {
         if (!document.body.contains(panel)) document.body.appendChild(panel);
