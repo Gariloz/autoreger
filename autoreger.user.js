@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         autoreger
 // @namespace    http://tampermonkey.net/
-// @version      5.6
-// @description  Автозаполнитель регистрации: инкремент, пароль в оба поля, отдача подтверждённых, детект ручных регистраций (переход и перезагрузка), без дублей
+// @version      5.7
+// @description  Автозаполнитель регистрации: инкремент, пароль в оба поля, отдача подтверждённых, детект ручных регистраций, статус без автоскрытия
 // @match        *://*/*
 // @noframes
 // @grant        GM_getValue
@@ -62,7 +62,6 @@
     let pending  = GM_getValue('pending', null);
     let manualTrack = GM_getValue('manualTrack', { login: '', loginTime: 0, signupTime: 0 });
     let lastAutoNav = 0;
-    let flashTimer = null;
     let registering = false;
     let observer = null;
     let staleMsgEls = new Set();
@@ -140,7 +139,7 @@
         <div style="display:flex;align-items:center;justify-content:space-between;">
             <div style="color:#e4e4ec;font-size:12px;font-weight:bold;letter-spacing:2px;text-transform:uppercase;">autoreger</div>
             <div style="display:flex;align-items:center;gap:6px;">
-                <div style="color:#6b6b76;font-size:10px;">v5.6</div>
+                <div style="color:#6b6b76;font-size:10px;">v5.7</div>
                 <button id="gm-hide" type="button" title="Скрыть панель на этом сайте"
                         style="padding:2px 8px;background:#333;color:#fff;border:0;border-radius:6px;cursor:pointer;font-size:13px;line-height:1;">–</button>
             </div>
@@ -226,11 +225,10 @@
     }
     syncTextarea();
 
+    // Статус висит постоянно, пока его не перекроет следующий вывод.
     function flash(msg, ok = true) {
         statusEl.textContent = msg;
         statusEl.style.color = ok ? '#4ade80' : '#f87171';
-        clearTimeout(flashTimer);
-        flashTimer = setTimeout(() => { statusEl.textContent = ''; }, 4000);
     }
 
     function updateLabels() {
@@ -295,7 +293,7 @@
     function commitPending() {
         if (!pending) return;
         const { login, pass } = pending;
-        justCommitted = true; // чтобы детект ручных не сработал вслед за скриптовым успехом
+        justCommitted = true;
         clearPending();
         current = nextValue(login);
         GM_setValue('current', current);
@@ -618,7 +616,6 @@
         }
     }
 
-    // Загрузка сразу на success-странице вскоре после регистрации = ручная регистрация с перезагрузкой.
     if (CONFIG.successUrlPattern.test(location.pathname)) tryManualSuccess(true);
 
     setInterval(() => {
